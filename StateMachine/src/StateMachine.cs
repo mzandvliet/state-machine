@@ -1,5 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
 using System.Reflection;
 using RamjetAnvil.Coroutine;
 
@@ -44,10 +46,8 @@ namespace RamjetAnvil.StateMachine {
     }
 
     public interface IStateMachine {
-        CoroutineScheduler Scheduler { get; }
-
         void Transition(StateId stateId, params object[] args);
-        void TransitionToParent();
+        void TransitionToParent(params object[] args);
     }
 
     /// <summary>
@@ -56,18 +56,14 @@ namespace RamjetAnvil.StateMachine {
     /// <typeparam name="T">The type of the object that owns this StateMachine</typeparam>
     public class StateMachine<T> : IStateMachine {
         private readonly T _owner;
-        private readonly CoroutineScheduler _scheduler;
+        private readonly ICoroutineScheduler _scheduler;
         private readonly IDictionary<StateId, StateInstance> _states;
         private readonly IteratableStack<StateInstance> _stack;
 
         private readonly IDictionary<string, EventInfo> _ownerEvents;
         private bool _isTransitioning;
 
-        public CoroutineScheduler Scheduler {
-            get { return _scheduler; }
-        }
-
-        public StateMachine(T owner, CoroutineScheduler scheduler) {
+        public StateMachine(T owner, ICoroutineScheduler scheduler) {
             _owner = owner;
             _scheduler = scheduler;
 
@@ -92,45 +88,104 @@ namespace RamjetAnvil.StateMachine {
 
         public void Transition(StateId stateId, params object[] args) {
             if (_isTransitioning) {
-                return;
+                throw new Exception("Cannot transition while another transition is already active.");
             }
 
-            StateInstance oldState = null;
             StateInstance newState = _states[stateId];
 
-            if (_stack.Count > 0) {
-                oldState = _stack.Peek();
-
+            if (_stack.Count == 0) {
+                _scheduler.Run(EnterNewState(newState, args));
+            }
+            else {
+                StateInstance oldState = _stack.Peek();
+                
                 var isNormalTransition = oldState.Transitions.Contains(stateId);
                 var isChildTransition = !isNormalTransition && oldState.ChildTransitions.Contains(stateId);
 
-                if (!isNormalTransition && !isChildTransition) {
+                if (isChildTransition) {
+                    _scheduler.Run(TransitionToChild(oldState, newState, args));
+                } else if (isNormalTransition) {
+                    _scheduler.Run(Transition(oldState, newState, args));
+                }
+                else {
                     throw new Exception(string.Format(
                         "Transition from state '{0}' to state '{1}' is not registered, transition failed",
                         oldState.StateId,
                         stateId));
                 }
-
-                InvokeStateLifeCycleMethod(oldState.OnExit);
-
-                if (isNormalTransition) {
-                    _stack.Pop();
-                }
             }
-
-            _stack.Push(newState);
-            SubscribeToStateMethods(oldState, newState);
-            InvokeStateLifeCycleMethod(newState.OnEnter, args);
         }
 
-        public void TransitionToParent() {
+        private IEnumerator<WaitCommand> Transition(StateInstance oldState, StateInstance newState, object[] enterParams) {
+            yield return WaitCommand.WaitRoutine(ExitOldState(oldState));
+            yield return WaitCommand.WaitRoutine(EnterNewState(newState, enterParams));
+        }
+
+        private IEnumerator<WaitCommand> ExitOldState(StateInstance oldState) {
+            _isTransitioning = true;
+            UnsubscribeToStateMethods(oldState);
+            _stack.Pop();
+            yield return WaitCommand.WaitRoutine(InvokeStateLifeCycleMethod(oldState.OnExit));
+            _isTransitioning = false;
+        }
+
+        private IEnumerator<WaitCommand> EnterNewState(StateInstance newState, object[] enterParams) {
+            _isTransitioning = true;
+            yield return WaitCommand.WaitRoutine(InvokeStateLifeCycleMethod(newState.OnEnter, enterParams));
+            _stack.Push(newState);
+            SubscribeToStateMethods(newState);
+            _isTransitioning = false;
+        }
+
+        private IEnumerator<WaitCommand> TransitionToChild(StateInstance parentState, StateInstance childState, object[] enterParams) {
+            _isTransitioning = true;
+            UnsubscribeToStateMethods(parentState);
+            yield return WaitCommand.WaitRoutine(InvokeStateLifeCycleMethod(parentState.OnSuspend));
+            yield return WaitCommand.WaitRoutine(InvokeStateLifeCycleMethod(childState.OnEnter, enterParams));
+            _stack.Push(childState);
+            SubscribeToStateMethods(childState);
+            _isTransitioning = false;
+        }
+
+        private IEnumerator<WaitCommand> TransitionToParent(StateInstance childState, StateInstance parentState, object[] resumeParams) {
+            _isTransitioning = true;
+            UnsubscribeToStateMethods(childState);
+            _stack.Pop();
+            yield return WaitCommand.WaitRoutine(InvokeStateLifeCycleMethod(childState.OnExit));
+            yield return WaitCommand.WaitRoutine(InvokeStateLifeCycleMethod(parentState.OnResume, resumeParams));
+            SubscribeToStateMethods(parentState);
+            _isTransitioning = false;
+        }
+
+        private IEnumerator<WaitCommand> InvokeStateLifeCycleMethod(Delegate del, params object[] args) {
+            // TODO Use identity wait command
+            WaitCommand waitCommand = WaitCommand.DontWait;
+            if (del != null) {
+                try {
+                    if (del.Method.ReturnType == typeof(IEnumerator<WaitCommand>)) {
+                        waitCommand = WaitCommand.WaitRoutine((IEnumerator<WaitCommand>)del.DynamicInvoke(args));
+                    } else {
+                        del.DynamicInvoke(args);
+                    }
+                } catch (TargetParameterCountException e) {
+                    throw new ArgumentException(GetArgumentExceptionDetails((State)del.Target, del, args), e);
+                }
+            }
+            yield return waitCommand;
+        }
+
+
+        public void TransitionToParent(params object[] args) {
+            if (_isTransitioning) {
+                throw new Exception("Cannot transition while another transition is already active.");
+            }
             if (_stack.Count <= 1) {
                 throw new InvalidOperationException("Cannot transition to parent state, currently at top-level state");
             }
 
-            var oldState = _stack.Pop();
-            InvokeStateLifeCycleMethod(oldState.OnExit);
-            SubscribeToStateMethods(oldState, _stack.Peek());
+            var childState = _stack.Pop();
+            var parentState = _stack.Peek();
+            _scheduler.Run(TransitionToParent(childState, parentState, args));
         }
 
         private const BindingFlags Flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
@@ -182,51 +237,25 @@ namespace RamjetAnvil.StateMachine {
             return implementedMethods;
         }
 
-        private void SubscribeToStateMethods(StateInstance oldState, StateInstance newState) {
+        private void UnsubscribeToStateMethods(StateInstance state) {
             // Todo: is there an easier way to clear the list of subscribers?
             foreach (var pair in _ownerEvents) {
                 // Unregister delegates of the old state
-                if (oldState != null && oldState.StateDelegates.ContainsKey(pair.Key)) {
-                    pair.Value.RemoveEventHandler(_owner, oldState.StateDelegates[pair.Key]);
+                if (state != null && state.StateDelegates.ContainsKey(pair.Key)) {
+                    pair.Value.RemoveEventHandler(_owner, state.StateDelegates[pair.Key]);
                 }
+            }
+        }
+
+        // Todo: Separate into sub/unsub pair
+        private void SubscribeToStateMethods(StateInstance state) {
+            // Todo: is there an easier way to clear the list of subscribers?
+            foreach (var pair in _ownerEvents) {
                 // Register delegates of the new state
-                if (newState.StateDelegates.ContainsKey(pair.Key)) {
-                    pair.Value.AddEventHandler(_owner, newState.StateDelegates[pair.Key]);
+                if (state.StateDelegates.ContainsKey(pair.Key)) {
+                    pair.Value.AddEventHandler(_owner, state.StateDelegates[pair.Key]);
                 }
             }
-        }
-
-        /// <summary>
-        /// Invokes OnEnter/OnExit function. Runs function as a coroutine if it is implemented as one.
-        /// </summary>
-        /// <param name="del"></param>
-        /// <param name="args"></param>
-        private void InvokeStateLifeCycleMethod(Delegate del, params object[] args) {
-            if (del == null) {
-                return;
-            }
-
-            try {
-                if (del.Method.ReturnType == typeof(IEnumerator<WaitCommand>)) {
-                    _scheduler.Start(WaitForTransition((IEnumerator<WaitCommand>)del.DynamicInvoke(args)));
-                } else {
-                    del.DynamicInvoke(args);
-                }
-            } catch (TargetParameterCountException e) {
-                throw new ArgumentException(GetArgumentExceptionDetails((State)del.Target, del, args));
-            }
-        }
-
-        /// <summary>
-        ///  Performs the given transition coroutine, and block any state transitions while doing so
-        /// </summary>
-        /// <param name="transition"></param>
-        /// <returns></returns>
-        private IEnumerator<WaitCommand> WaitForTransition(IEnumerator<WaitCommand> transition) {
-            
-            _isTransitioning = true;
-            yield return WaitCommand.WaitRoutine(transition);
-            _isTransitioning = false;
         }
 
         private string GetArgumentExceptionDetails(State state, Delegate del, params object[] args) {
@@ -295,6 +324,8 @@ namespace RamjetAnvil.StateMachine {
         private readonly State _state;
         private readonly Delegate _onEnter;
         private readonly Delegate _onExit;
+        private readonly Delegate _onSuspend;
+        private readonly Delegate _onResume;
         private readonly IDictionary<string, Delegate> _stateDelegates;
 
         public Delegate OnEnter {
@@ -303,6 +334,14 @@ namespace RamjetAnvil.StateMachine {
 
         public Delegate OnExit {
             get { return _onExit; }
+        }
+
+        public Delegate OnSuspend {
+            get { return _onSuspend; }
+        }
+
+        public Delegate OnResume {
+            get { return _onResume; }
         }
 
         public StateInstance(StateId stateId, State state, IDictionary<string, Delegate> stateDelegates) {
@@ -315,6 +354,8 @@ namespace RamjetAnvil.StateMachine {
 
             _onEnter = GetDelegateByName(State, "OnEnter");
             _onExit = GetDelegateByName(State, "OnExit");
+            _onSuspend = GetDelegateByName(State, "OnSuspend");
+            _onResume = GetDelegateByName(State, "OnResume");
         }
 
         public StateId StateId { get; private set; }
@@ -347,6 +388,7 @@ namespace RamjetAnvil.StateMachine {
 
             var method = type.GetMethod(name, Flags);
             if (method != null) {
+                UnityEngine.Debug.Log("Found Lifecycle Method: " + name);
                 return ReflectionUtils.ToDelegate(method, state);
             }
             return null;
