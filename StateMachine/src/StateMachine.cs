@@ -95,17 +95,16 @@ namespace RamjetAnvil.StateMachine {
 
             if (_stack.Count == 0) {
                 _scheduler.Run(EnterNewState(newState, args));
-            }
-            else {
+            } else {
                 StateInstance oldState = _stack.Peek();
                 
                 var isNormalTransition = oldState.Transitions.Contains(stateId);
-                var isChildTransition = !isNormalTransition && oldState.ChildTransitions.Contains(stateId);
+                var isChildTransition = oldState.ChildTransitions.Contains(stateId);
 
-                if (isChildTransition) {
+                if (isNormalTransition) {
+                    _scheduler.Run(Transition(newState, args));
+                } else if (isChildTransition) {
                     _scheduler.Run(TransitionToChild(oldState, newState, args));
-                } else if (isNormalTransition) {
-                    _scheduler.Run(Transition(oldState, newState, args));
                 }
                 else {
                     throw new Exception(string.Format(
@@ -116,22 +115,24 @@ namespace RamjetAnvil.StateMachine {
             }
         }
 
-        private IEnumerator<WaitCommand> Transition(StateInstance oldState, StateInstance newState, object[] enterParams) {
-            yield return WaitCommand.WaitRoutine(ExitOldState(oldState));
+        private IEnumerator<WaitCommand> Transition(StateInstance newState, object[] enterParams) {
+            yield return WaitCommand.WaitRoutine(ExitOldState());
             yield return WaitCommand.WaitRoutine(EnterNewState(newState, enterParams));
         }
 
-        private IEnumerator<WaitCommand> ExitOldState(StateInstance oldState) {
+        private IEnumerator<WaitCommand> ExitOldState() {
             _isTransitioning = true;
-            UnsubscribeToStateMethods(oldState);
-            _stack.Pop();
-            yield return WaitCommand.WaitRoutine(InvokeStateLifeCycleMethod(oldState.OnExit));
+            while (_stack.Count > 0) {
+                var state = _stack.Pop();
+                UnsubscribeToStateMethods(state);
+                yield return WaitCommand.WaitRoutine(InvokeStateLifeCycleMethod(state.OnExit));    
+            }
             _isTransitioning = false;
         }
 
         private IEnumerator<WaitCommand> EnterNewState(StateInstance newState, object[] enterParams) {
             _isTransitioning = true;
-            yield return WaitCommand.WaitRoutine(InvokeStateLifeCycleMethod(newState.OnEnter, enterParams));
+            yield return InvokeStateLifeCycleMethod(newState.OnEnter, enterParams).AsWaitCommand();
             _stack.Push(newState);
             SubscribeToStateMethods(newState);
             _isTransitioning = false;
@@ -140,25 +141,25 @@ namespace RamjetAnvil.StateMachine {
         private IEnumerator<WaitCommand> TransitionToChild(StateInstance parentState, StateInstance childState, object[] enterParams) {
             _isTransitioning = true;
             UnsubscribeToStateMethods(parentState);
-            yield return WaitCommand.WaitRoutine(InvokeStateLifeCycleMethod(parentState.OnSuspend));
-            yield return WaitCommand.WaitRoutine(InvokeStateLifeCycleMethod(childState.OnEnter, enterParams));
+            yield return InvokeStateLifeCycleMethod(parentState.OnSuspend).AsWaitCommand();
+            yield return InvokeStateLifeCycleMethod(childState.OnEnter, enterParams).AsWaitCommand();
             _stack.Push(childState);
             SubscribeToStateMethods(childState);
             _isTransitioning = false;
         }
 
-        private IEnumerator<WaitCommand> TransitionToParent(StateInstance childState, StateInstance parentState, object[] resumeParams) {
+        private IEnumerator<WaitCommand> TransitionToParentInternal(object[] resumeParams) {
             _isTransitioning = true;
+            var childState = _stack.Pop();
+            var parentState = _stack.Peek();
             UnsubscribeToStateMethods(childState);
-            _stack.Pop();
-            yield return WaitCommand.WaitRoutine(InvokeStateLifeCycleMethod(childState.OnExit));
-            yield return WaitCommand.WaitRoutine(InvokeStateLifeCycleMethod(parentState.OnResume, resumeParams));
+            yield return InvokeStateLifeCycleMethod(childState.OnExit).AsWaitCommand();
+            yield return InvokeStateLifeCycleMethod(parentState.OnResume, resumeParams).AsWaitCommand();
             SubscribeToStateMethods(parentState);
             _isTransitioning = false;
         }
 
         private IEnumerator<WaitCommand> InvokeStateLifeCycleMethod(Delegate del, params object[] args) {
-            // TODO Use identity wait command
             WaitCommand waitCommand = WaitCommand.DontWait;
             if (del != null) {
                 try {
@@ -183,9 +184,7 @@ namespace RamjetAnvil.StateMachine {
                 throw new InvalidOperationException("Cannot transition to parent state, currently at top-level state");
             }
 
-            var childState = _stack.Pop();
-            var parentState = _stack.Peek();
-            _scheduler.Run(TransitionToParent(childState, parentState, args));
+            _scheduler.Run(TransitionToParentInternal(args));
         }
 
         private const BindingFlags Flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
@@ -388,7 +387,6 @@ namespace RamjetAnvil.StateMachine {
 
             var method = type.GetMethod(name, Flags);
             if (method != null) {
-                UnityEngine.Debug.Log("Found Lifecycle Method: " + name);
                 return ReflectionUtils.ToDelegate(method, state);
             }
             return null;
