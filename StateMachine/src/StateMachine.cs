@@ -88,7 +88,8 @@ namespace RamjetAnvil.StateMachine {
 
         public void Transition(StateId stateId, params object[] args) {
             if (_isTransitioning) {
-                throw new Exception("Cannot transition while another transition is already active.");
+                UnityEngine.Debug.LogWarning("Cannot transition to " + stateId + " while another transition is already active.");
+                return;
             }
 
             StateInstance newState = _states[stateId];
@@ -178,7 +179,8 @@ namespace RamjetAnvil.StateMachine {
 
         public void TransitionToParent(params object[] args) {
             if (_isTransitioning) {
-                throw new Exception("Cannot transition while another transition is already active.");
+                UnityEngine.Debug.LogWarning("Cannot transition to parent while another transition is already active.");
+                return;
             }
             if (_stack.Count <= 1) {
                 throw new InvalidOperationException("Cannot transition to parent state, currently at top-level state");
