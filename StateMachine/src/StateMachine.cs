@@ -46,6 +46,8 @@ namespace RamjetAnvil.StateMachine {
     }
 
     public interface IStateMachine {
+        StateId CurrentState { get; }
+        bool IsTransitioning { get; }
         void Transition(StateId stateId, params object[] args);
         void TransitionToParent(params object[] args);
     }
@@ -114,6 +116,20 @@ namespace RamjetAnvil.StateMachine {
                         stateId));
                 }
             }
+        }
+
+        public StateId CurrentState {
+            get
+            {
+                if (_stack.Count == 0) {
+                    throw new Exception("No active state");
+                }
+                return _stack.Peek().StateId;
+            }
+        }
+
+        public bool IsTransitioning {
+            get { return _isTransitioning; }
         }
 
         private IEnumerator<WaitCommand> Transition(StateInstance newState, object[] enterParams) {
