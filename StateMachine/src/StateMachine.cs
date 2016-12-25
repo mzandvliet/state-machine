@@ -48,8 +48,8 @@ namespace RamjetAnvil.StateMachine {
     public interface IStateMachine {
         StateId CurrentState { get; }
         bool IsTransitioning { get; }
-        void Transition(StateId stateId, params object[] args);
-        void TransitionToParent(params object[] args);
+        IAwaitable Transition(StateId stateId, params object[] args);
+        IAwaitable TransitionToParent(params object[] args);
     }
 
     /// <summary>
@@ -88,16 +88,16 @@ namespace RamjetAnvil.StateMachine {
             return instance;
         }
 
-        public void Transition(StateId stateId, params object[] args) {
+        public IAwaitable Transition(StateId stateId, params object[] args) {
             if (_isTransitioning) {
                 UnityEngine.Debug.LogWarning("Cannot transition to " + stateId + " while another transition is already active.");
-                return;
+                return EmptyAwaitable.Default;
             }
 
             StateInstance newState = _states[stateId];
 
             if (_stack.Count == 0) {
-                _scheduler.Run(EnterNewState(newState, args));
+                return _scheduler.Run(EnterNewState(newState, args));
             } else {
                 StateInstance oldState = _stack.Peek();
                 
@@ -105,9 +105,9 @@ namespace RamjetAnvil.StateMachine {
                 var isChildTransition = oldState.ChildTransitions.Contains(stateId);
 
                 if (isNormalTransition) {
-                    _scheduler.Run(Transition(newState, args));
+                    return _scheduler.Run(Transition(newState, args));
                 } else if (isChildTransition) {
-                    _scheduler.Run(TransitionToChild(oldState, newState, args));
+                    return _scheduler.Run(TransitionToChild(oldState, newState, args));
                 }
                 else {
                     throw new Exception(string.Format(
@@ -193,16 +193,16 @@ namespace RamjetAnvil.StateMachine {
         }
 
 
-        public void TransitionToParent(params object[] args) {
+        public IAwaitable TransitionToParent(params object[] args) {
             if (_isTransitioning) {
                 UnityEngine.Debug.LogWarning("Cannot transition to parent while another transition is already active.");
-                return;
+                return EmptyAwaitable.Default;
             }
             if (_stack.Count <= 1) {
                 throw new InvalidOperationException("Cannot transition to parent state, currently at top-level state");
             }
 
-            _scheduler.Run(TransitionToParentInternal(args));
+            return _scheduler.Run(TransitionToParentInternal(args));
         }
 
         private const BindingFlags Flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
